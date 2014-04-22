@@ -1,0 +1,262 @@
+Description: RFC3422 Classless Static Route Support (dhcp option 121)
+Adds support for pushing static routes at initrd time via dhcp option 121. 
+This is needed in some complex diskless boot scenarios. 
+ klibc (1.5.25-1ubuntu2) precise; urgency=low
+ .
+   * Fix cross building - LP: #963047
+Author: Alexandru Bordei <alexandru.bordei@bigstep.com>
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/963047
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: http://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: <YYYY-MM-DD>
+
+--- klibc-1.5.25.orig/usr/kinit/ipconfig/netdev.c
++++ klibc-1.5.25/usr/kinit/ipconfig/netdev.c
+@@ -13,11 +13,19 @@
+ #include <netinet/in.h>
+ #include <linux/route.h>
+ #include <linux/sockios.h>
++#include <arpa/inet.h>
+ 
+ #include "netdev.h"
+ 
+ static int cfd = -1;
+ 
++static char *ntoa(uint32_t addr)
++{
++        struct in_addr in = { addr };
++        return inet_ntoa(in);
++}
++
++
+ static void copy_name(struct netdev *dev, struct ifreq *ifr)
+ {
+ 	strncpy(ifr->ifr_name, dev->name, sizeof(ifr->ifr_name));
+@@ -109,6 +117,53 @@ int netdev_setdefaultroute(struct netdev
+ 	return 0;
+ }
+ 
++int netdev_setstaticroutes(struct netdev *dev)
++{
++
++	struct rtentry r;
++	struct classless_static_route *csr=NULL;
++	int i;
++
++	if(dev->static_routes_count<=0)
++		return 0;	
++
++	if(dev->static_routes==NULL)
++		return 0;
++	
++	for(i=0;i<dev->static_routes_count;i++)
++	{				
++		csr=dev->static_routes+i*sizeof(struct classless_static_route);
++
++		if(csr->router==0)
++			continue; //ignore 0.0.0.0 routers as requested by RFC3442
++
++		char strDestination[16],strNetmask[16],strRouter[16];
++
++		strncpy(strDestination,	ntoa(csr->destination),	sizeof(strDestination));
++		strncpy(strNetmask,	ntoa(csr->netmask),	sizeof(strNetmask));
++		strncpy(strRouter,	ntoa(csr->router),	sizeof(strRouter));
++
++		printf("IP-Config: Setting classless static route to %s netmask %s via %s\n", strDestination, strNetmask , strRouter);
++
++		memset(&r, 0, sizeof(r));
++
++		set_s_addr(&r.rt_dst, 	  csr->destination);
++		set_s_addr(&r.rt_gateway, csr->router);
++		set_s_addr(&r.rt_genmask, csr->netmask);
++		r.rt_flags = RTF_UP | RTF_GATEWAY;
++
++		if (ioctl(cfd, SIOCADDRT, &r) == -1 && errno != EEXIST) {
++			perror("SIOCADDRT");
++			return -1;
++		}
++
++	}
++
++	return 0;
++}
++
++
++
+ int netdev_setmtu(struct netdev *dev)
+ {
+ 	struct ifreq ifr;
+--- klibc-1.5.25.orig/usr/kinit/ipconfig/main.c
++++ klibc-1.5.25/usr/kinit/ipconfig/main.c
+@@ -89,6 +89,9 @@ static void configure_device(struct netd
+ 	if (netdev_setdefaultroute(dev))
+ 		printf("IP-Config: failed to set default route on %s\n",
+ 		       dev->name);
++	if (netdev_setstaticroutes(dev))
++		printf("IP-Config: failed to set static routes on %s\n",
++		       dev->name);
+ 	if (dev->hostname[0] &&
+ 			sethostname(dev->hostname, strlen(dev->hostname)))
+ 		printf("IP-Config: failed to set hostname '%s' from %s\n",
+--- klibc-1.5.25.orig/usr/kinit/ipconfig/dhcp_proto.c
++++ klibc-1.5.25/usr/kinit/ipconfig/dhcp_proto.c
+@@ -7,6 +7,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <time.h>
++#include <stdlib.h>
+ 
+ #include "ipconfig.h"
+ #include "netdev.h"
+@@ -25,6 +26,7 @@ static uint8_t dhcp_params[] = {
+ 	26,			/* interface mtu */
+ 	28,			/* broadcast addr */
+ 	40,			/* NIS domain name (why?) */
++	121,			/* RFC3422 Classless Static Route Option */
+ };
+ 
+ static uint8_t dhcp_discover_hdr[] = {
+@@ -71,6 +73,80 @@ static struct iovec dhcp_request_iov[DHC
+ 	/* [6] = {dhcp_end, sizeof(dhcp_end)} */
+ };
+ 
++
++/*
++* Parse a RFC 3442 classless static route option. 
++* For more information see http://www.ietf.org/rfc/rfc3442.txt
++* Each static route is a destination descriptor plus a gateway. The destination gateway
++* is prefixed by the netmask. 
++*/
++static int dhcp_rfc3442_parse(struct netdev *dev, uint8_t *opt)
++{
++	if(opt[0]!=121)
++		return 0;
++
++	uint8_t len=opt[1];
++	uint8_t i=2; //skip the 121 and the len field
++	uint8_t b=0;
++
++	//we can have at most len/5 routes (one destination prefix=0 and a gateway with 4 bytes) 			
++	uint8_t * significant_bytes=(uint8_t*)malloc(sizeof(uint8_t)*(len/5)); 
++	uint8_t * destination_descriptor=NULL;
++		
++	dev->static_routes_count=0;
++
++	while(i<len+2)
++	{
++		destination_descriptor = opt+i;
++
++		uint8_t s1=*destination_descriptor/8;	
++		uint8_t s2=*destination_descriptor % 8 ? 1 : 0;
++
++		significant_bytes[dev->static_routes_count]=s1+s2;	
++
++		i+=1+significant_bytes[dev->static_routes_count]+4;
++		dev->static_routes_count++;
++	}	
++	
++	dev->static_routes=(struct classless_static_route*) 
++			    malloc(dev->static_routes_count*sizeof(struct classless_static_route)); 
++
++	 if (dev->static_routes == NULL) {
++		fprintf(stderr, "out of memory\n");
++		free(significant_bytes);
++		return -1;
++	}
++
++	memset(dev->static_routes,0,dev->static_routes_count*sizeof(struct classless_static_route));
++
++	destination_descriptor = opt+2;
++
++	for(i=0;i<dev->static_routes_count;i++)
++	{
++		struct classless_static_route * static_route = dev->static_routes+ i*sizeof(struct classless_static_route);
++		
++		static_route->netmask = htonl(~((1 << (32 - *destination_descriptor)) - 1));
++
++		destination_descriptor+=1;
++		uint32_t destination=0;	
++
++		for(b=0;b<significant_bytes[i];b++)	
++			destination = (destination << 8 ) + *(destination_descriptor+b);	
++	
++		destination <<= 8*(4-significant_bytes[i]);
++
++		static_route->destination=htonl(destination);
++		destination_descriptor+=significant_bytes[i];
++
++		memcpy(&static_route->router, destination_descriptor,4); 
++		
++		destination_descriptor+=4;
++	}
++	free(significant_bytes);
++	return 0;
++}
++
++
+ /*
+  * Parse a DHCP response packet
+  * Returns:
+@@ -90,6 +166,7 @@ static int dhcp_parse(struct netdev *dev
+ 	    exts[2] == 83 && exts[3] == 99) {
+ 		uint8_t *ext;
+ 
++
+ 		for (ext = exts + 4; ext - exts < extlen;) {
+ 			uint8_t len, *opt = ext++;
+ 			if (*opt == 0)
+@@ -103,6 +180,9 @@ static int dhcp_parse(struct netdev *dev
+ 				type = opt[2];
+ 			if (*opt == 54)
+ 				memcpy(&serverid, opt + 2, 4);
++			if(*opt == 121)
++				dhcp_rfc3442_parse(dev,opt);	
++			
+ 		}
+ 	}
+ 
+--- klibc-1.5.25.orig/usr/kinit/ipconfig/netdev.h
++++ klibc-1.5.25/usr/kinit/ipconfig/netdev.h
+@@ -7,6 +7,15 @@
+ #define BPLEN		256
+ #define FNLEN		128			/* from DHCP  RFC 2131 */
+ 
++
++
++struct classless_static_route
++{
++	uint32_t destination;
++	uint32_t netmask;
++	uint32_t router;
++};
++
+ struct netdev {
+ 	const char *name;	/* Device name          */
+ 	unsigned int ifindex;	/* interface index      */
+@@ -42,6 +51,8 @@ struct netdev {
+ 	char bootpath[BPLEN];	/* boot path            */
+ 	char filename[FNLEN];   /* filename             */
+ 	struct netdev *next;	/* next configured i/f  */
++	unsigned int static_routes_count; /* RFC3422 routes count */	
++	struct classless_static_route *static_routes; /* RFC3442 classless static route */ 
+ };
+ 
+ extern struct netdev *ifaces;
+@@ -66,6 +77,7 @@ extern struct netdev *ifaces;
+ int netdev_getflags(struct netdev *dev, short *flags);
+ int netdev_setaddress(struct netdev *dev);
+ int netdev_setdefaultroute(struct netdev *dev);
++int netdev_setstaticroutes(struct netdev *dev);
+ int netdev_up(struct netdev *dev);
+ int netdev_down(struct netdev *dev);
+ int netdev_init_if(struct netdev *dev);
