@@ -1,0 +1,42 @@
+--- /etc/initramfs-tools/scripts/local-top/iscsi.orig	2013-12-18 08:17:34.652976230 +0000
++++ /etc/initramfs-tools/scripts/local-top/iscsi	2013-12-18 08:40:46.079872048 +0000
+@@ -17,6 +17,10 @@
+             iscsi_pw=*)
+                iscsi_pw=${x#iscsi_pw=}
+                ;;
++	    ip=*)
++               ip=${x#ip=}
++               ;;
++
+       esac
+    done # end of cmdline parsing
+    if [ -n "${iscsi_ip}" ]; then
+@@ -37,6 +41,28 @@
+             exit 0
+          fi
+       done # end of until
++
++      if [ ${ip} -eq "ibft" ]; then 	
++	echo "Configuring network card using ibft"
++	    cd /sys/firmware/ibft/ethernet0
++	    mac=$(cat mac)
++	    ip_addr=$(cat ip-addr)
++	    subnet_mask=$(cat subnet-mask)
++
++	    cd /sys/class/net
++	    for dev in *; do
++		[ -e $dev/address ] || continue
++	       address=$(cat $dev/address)
++	       [ "$address" ] || continue
++	       if [ "$address" = "$mac" ]; then
++		   ip addr add $ip_addr/$subnet_mask brd  dev $dev
++		   ip link set dev $dev up
++		   touch /tmp/net-${dev}.conf
++		   break
++	       fi
++	    done
++	fi	    
++ 
+       echo "Searching for an dhcp server on all network interfaces..."
+       CNT=5
+       until ifconfig ${netdev}|grep -q "inet addr"; do
